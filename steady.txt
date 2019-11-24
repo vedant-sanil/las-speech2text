@@ -1,0 +1,428 @@
+import os
+import time
+import numpy as np
+import pickle as pk 
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F 
+import torch.nn.utils as utils
+from Levenshtein import distance 
+from torch.utils.data import DataLoader, Dataset
+
+if torch.cuda.is_available():
+    USE_CUDA = True
+    print("Cuda available!")
+else:
+    USE_CUDA = False 
+
+class pBLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(pBLSTM, self).__init__()
+        self.blstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, num_layers=1, bidirectional=True)
+
+    def forward(self, x):
+        return self.blstm(x)
+
+class Listener(nn.Module):
+    def __init__(self, input_dim, hidden_dim, value_size=128, key_size=128):
+        super(Listener, self).__init__()
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, num_layers=1, bidirectional=True)
+
+        # Define blocks of pyramidal pBLSTMs
+        self.prnn1 = pBLSTM(input_dim=hidden_dim*2, hidden_dim=hidden_dim)
+        self.prnn2 = pBLSTM(input_dim=hidden_dim*2, hidden_dim=hidden_dim)
+        self.prnn3 = pBLSTM(input_dim=hidden_dim*2, hidden_dim=hidden_dim)
+
+        self.key_network = nn.Linear(hidden_dim*2, value_size)
+        self.value_network = nn.Linear(hidden_dim*2, key_size)
+
+    def forward(self, x, lens):
+        rnn_inp = utils.rnn.pack_padded_sequence(x, lengths=lens, enforce_sorted=False)
+        outputs, _ = self.lstm(rnn_inp)
+        linear_input, _ = utils.rnn.pad_packed_sequence(outputs)
+
+        # Pass outputs through pBLSTM blocks
+        # Layer 1
+        outputs = self.reshape_and_pool(linear_input)
+        lens = lens//2
+        rnn_inp = utils.rnn.pack_padded_sequence(outputs, lengths=lens, enforce_sorted=False)
+        outputs, _ = self.prnn1(rnn_inp)
+        linear_input, _ = utils.rnn.pad_packed_sequence(outputs)
+
+        # Layer 2
+        outputs = self.reshape_and_pool(linear_input)
+        lens = lens//2
+        rnn_inp = utils.rnn.pack_padded_sequence(outputs, lengths=lens, enforce_sorted=False)
+        outputs, _ = self.prnn2(rnn_inp)
+        linear_input, _ = utils.rnn.pad_packed_sequence(outputs)
+
+        # Layer 3
+        outputs = self.reshape_and_pool(linear_input)
+        lens = lens//2
+        rnn_inp = utils.rnn.pack_padded_sequence(outputs, lengths=lens, enforce_sorted=False)
+        outputs, _ = self.prnn3(rnn_inp)
+        linear_input, _ = utils.rnn.pad_packed_sequence(outputs)
+
+        #linear_input, _ = utils.rnn.pad_packed_sequence(outputs)
+        keys = self.key_network(linear_input)
+        value = self.value_network(linear_input)
+
+        return keys, value, lens
+
+    def reshape_and_pool(self, inputs):
+        # Check if the input length is odd and cut it
+        if inputs.shape[0] % 2 != 0:
+            inputs = inputs[:-1,:,:]
+
+        outputs = torch.transpose(inputs,0,1)
+        outputs = outputs.view(outputs.shape[0],outputs.shape[1]//2,2,outputs.shape[2])
+        outputs = torch.mean(outputs, 2)
+        outputs = torch.transpose(outputs,0,1)
+
+        return outputs
+
+class Attention(nn.Module):
+  def __init__(self):
+        super(Attention, self).__init__()
+        self.sm = nn.Softmax(dim=1)
+  def forward(self, query, key, value, lens):
+        '''
+        :param query :(N,context_size) Query is the output of LSTMCell from Decoder
+        :param key: (N,key_size) Key Projection from Encoder per time step
+        :param value: (N,value_size) Value Projection from Encoder per time step
+        :return output: Attended Context
+        :return attention_mask: Attention mask that can be plotted  
+        '''
+        # Convert the shape of Key from (T,N,H) -> (N,T,H)
+        key = torch.transpose(key, 0, 1)                    # Key is a padded sequence
+        energy = torch.bmm(key, query.unsqueeze(2)).squeeze(2)
+        mask = torch.arange(energy.size(1)).unsqueeze(0) >= lens.unsqueeze(1)
+        mask = mask.to(device)
+        energy.masked_fill_(mask, -1e9)
+        attention = self.sm(energy)
+        
+        value = torch.transpose(value,0,1)
+        context = torch.bmm(attention.unsqueeze(1), value).squeeze(1)
+
+        return context
+
+class Speller(nn.Module):
+    def __init__(self, vocab_size, hidden_dim, value_size=128, key_size=128, isAttended=False):
+        super(Speller, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, hidden_dim)
+        
+        self.lstm1 = nn.LSTMCell(input_size=hidden_dim+value_size, hidden_size=hidden_dim)
+        self.lstm2 = nn.LSTMCell(input_size=hidden_dim, hidden_size=key_size)
+        self.isAttended = isAttended
+        if(isAttended):
+            self.attention = Attention()
+        self.character_prob = nn.Linear(key_size+value_size,vocab_size)
+
+    def forward(self, key, values, lens, text=None, train=True):
+        '''
+        :param key :(T,N,key_size) Output of the Encoder Key projection layer
+        :param values: (T,N,value_size) Output of the Encoder Value projection layer
+        :param text: (N,text_len) Batch input of text with text_length
+        :param lens: (N,) Lengths of sequence inputs
+        :param train: Train or eval mode
+        :return predictions: Returns the character perdiction probability 
+        '''
+        batch_size = key.shape[1]
+        if(train):
+            # Max_len here defines the batch
+            text = torch.transpose(text,0,1)
+            max_len =  text.shape[1]
+            embeddings = self.embedding(text)
+        else:
+            max_len = 250
+        
+        predictions = []
+        hidden_states = [None, None]
+        prediction = torch.zeros(batch_size,1).to(device)
+        context = values[0,:,:]
+
+        for i in range(max_len):
+            '''
+            Here you should implement Gumble noise and teacher forcing techniques
+            '''
+            if(train):
+                rand = np.random.random_sample()
+                if rand > TEACHER_FORCING_PARAM:
+                    char_embed = self.embedding(prediction.argmax(dim=-1))
+                else:
+                    char_embed = embeddings[:,i,:]
+            else:
+                char_embed = self.embedding(prediction.argmax(dim=-1))
+            
+            # Compute outputs from two LSTM cells
+            inp = torch.cat([char_embed, context], dim=1)
+            hidden_states[0] = self.lstm1(inp,hidden_states[0])
+            
+            inp_2 = hidden_states[0][0]
+            hidden_states[1] = self.lstm2(inp_2,hidden_states[1])
+
+            # Compute attention from the output of the second LSTM Cell
+            output = hidden_states[1][0]
+            context = self.attention(output, key, values, lens)
+            
+            # Pass the output through a linear layer
+            prediction = self.character_prob(torch.cat([output, context], dim=1))
+            predictions.append(prediction.unsqueeze(1))
+
+        return torch.cat(predictions, dim=1)
+
+class Speech2Text_Dataset(Dataset):
+    def __init__(self, speech, text=None, train=True):
+        self.speech = speech
+        self.train = train
+        if (text is not None):
+            self.text = text
+    def __len__(self):
+        return self.speech.shape[0]
+    def __getitem__(self, index):
+        if(self.train):
+            return torch.tensor(self.speech[index].astype(np.float32)), torch.tensor(self.text[index])
+        else:
+            return torch.tensor(self.speech[index].astype(np.float32))
+
+class Seq2Seq(nn.Module):
+    def __init__(self,input_dim,vocab_size,hidden_dim,value_size=128, key_size=128,isAttended=True):
+        super(Seq2Seq,self).__init__()
+
+        # Define the encoder and decoder 
+        self.encoder = Listener(input_dim, hidden_dim)
+        self.decoder = Speller(vocab_size, hidden_dim, isAttended=True)
+
+    def forward(self,speech_input, speech_len, text_input=None,train=True):
+        key, value, lens = self.encoder(speech_input, speech_len)
+        if(train):
+            predictions = self.decoder(key, value, lens, text_input)
+        else:
+            predictions = self.decoder(key, value, lens, text=None, train=False)
+        return predictions
+
+def transform_letter_to_index(transcript, letter_list):
+    '''
+    :param transcript :(N, ) Transcripts are the text input
+    :param letter_list: Letter list defined above
+    :return letter_to_index_list: Returns a list for all the transcript sentence to index
+    '''
+    index_list = []
+    # Loops over each utterance
+    for i in range(transcript.shape[0]):
+        word_list = []
+        word_list.append(letter_list.index('<sos>'))
+        # Loops over each word in an utterance
+        for j in range(transcript[i].shape[0]):
+            # Loops over each letter in a word
+            for elem in list(transcript[i][j].decode("utf-8")):
+                word_list.append(letter_list.index(elem))
+            word_list.append(letter_list.index(' '))
+        word_list.append(letter_list.index('<eos>'))
+        index_list.append(word_list)
+        
+        '''
+        list_ind = index_list[0]
+        sent = ""
+        for i, a in enumerate(list_ind):
+            sent += letter_list[a] 
+        '''
+    return index_list
+
+def transform_index_to_letter(transcript, letter_list):
+    '''
+    :param transcript : 
+    :param letter_list: Letter list defined above
+    :return index_to_letter: Returns a list for all the transcript sentence to index
+    '''
+    op_list = ""
+    final_str = transcript
+    for i in range(final_str.shape[0]):
+        op_list += letter_list[final_str[i]]
+    
+    print(op_list)
+    return op_list
+
+def load_data():
+    speech_train = np.load('train_new.npy', allow_pickle=True, encoding='bytes')
+    speech_dev = np.load('dev_new.npy', allow_pickle=True, encoding='bytes')
+    speech_test = np.load('test_new.npy', allow_pickle=True, encoding='bytes')
+
+    transcript_train = np.load('./train_transcripts.npy', allow_pickle=True, encoding='bytes')
+    transcript_valid = np.load('./dev_transcripts.npy', allow_pickle=True, encoding='bytes')
+
+    print("Data loaded successfully")
+
+    return speech_train, speech_dev, speech_test, transcript_train, transcript_valid
+
+# Collate function for test
+def test_collate(batch):
+    inputs = batch
+    lens = [len(seq) for seq in inputs]
+    seq_order = sorted(range(len(lens)), key=lens.__getitem__, reverse=True)
+    inputs = [inputs[i] for i in seq_order]
+    input_len = torch.LongTensor([len(inp) for inp in inputs])
+    inputs = utils.rnn.pad_sequence(inputs)
+
+    return inputs, input_len
+
+# Collate function for dev
+def dev_collate(batch):
+    inputs, labels = zip(*batch)
+    lens = [len(seq) for seq in inputs]
+    seq_order = sorted(range(len(lens)), key=lens.__getitem__, reverse=True)
+    inputs = [inputs[i] for i in seq_order]
+    labels = [labels[i] for i in seq_order]
+    input_len = torch.LongTensor([len(inp) for inp in inputs])
+    labels_len = torch.LongTensor([len(inp) for inp in labels])
+    inputs = utils.rnn.pad_sequence(inputs)
+    
+    return inputs, labels, input_len, labels_len
+
+# Collate function for train
+def speech_collate(batch):
+    inputs, labels = zip(*batch)
+    lens = [len(seq) for seq in inputs]
+    seq_order = sorted(range(len(lens)), key=lens.__getitem__, reverse=True)
+    inputs = [inputs[i] for i in seq_order]
+    labels = [labels[i] for i in seq_order]
+    input_len = torch.LongTensor([len(inp) for inp in inputs])
+    labels_len = torch.LongTensor([len(inp) for inp in labels])
+    inputs = utils.rnn.pad_sequence(inputs)
+    labels = utils.rnn.pad_sequence(labels)
+    
+    return inputs, labels, input_len, labels_len
+
+def Main():
+
+    global device 
+    global TEACHER_FORCING_PARAM
+
+    NUM_EPOCHS = 50
+    TEACHER_FORCING_PARAM = 0.5
+    device = torch.device("cuda:0" if USE_CUDA else "cpu")
+    kwargs = {'num_workers':6, 'pin_memory':True} if USE_CUDA else {}
+
+    # List containing all Letters 
+    letter_list = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q',\
+             'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '-', "'", '.', '_', '+', ' ','<sos>','<eos>']
+
+    # Load data
+    speech_train, speech_dev, speech_test, transcript_train, transcript_valid = load_data()
+
+    # Convert the transcript to a list of indexes
+    character_text_train = transform_letter_to_index(transcript_train, letter_list)
+    character_text_valid = transform_letter_to_index(transcript_valid, letter_list)
+
+    print("List of indexes generated succesfully")
+
+    model = Seq2Seq(input_dim=40,vocab_size=len(letter_list),hidden_dim=128)
+    if USE_CUDA:
+        model.to(device)
+
+    # Initialize the data
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.CrossEntropyLoss(reduce=None).to(device)
+
+    train_dataset = Speech2Text_Dataset(speech_train, character_text_train)
+    val_dataset = Speech2Text_Dataset(speech_dev, character_text_valid)
+    test_dataset = Speech2Text_Dataset(speech_test)
+
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, collate_fn=speech_collate, **kwargs)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=dev_collate, **kwargs)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=test_collate, **kwargs)
+    
+    for epoch in range(NUM_EPOCHS):
+        # Train the model
+        model.train()
+        tot_loss = 0.0
+
+        for batch_num,(train, labels, train_len, labels_len) in enumerate(train_loader):
+            if USE_CUDA:
+                train, labels = train.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+
+            pred = model(train, train_len, labels)
+            mask = torch.zeros(labels.size()).to(device)
+
+            #labels = torch.transpose(labels,0,1).contiguous().view(-1)
+            pred = utils.rnn.pack_sequence(pred, enforce_sorted=True)
+            labels = utils.rnn.pack_sequence(labels, enforce_sorted=True)
+            
+            for idx, length in enumerate(labels_len):
+                mask[:length,idx] = 1
+            
+            mask = mask.view(-1).to(device)
+
+            #loss = criterion(pred.data, labels.data)
+            loss = criterion(pred.data, labels.data)
+            masked_loss = torch.sum(loss*mask)
+
+            masked_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 2)
+            optimizer.step()
+
+            current_loss = float(masked_loss.item())/int(torch.sum(mask).item())
+
+            if batch_num % 25 == 1:
+                print("Epoch ", epoch, "Training Loss ", current_loss)
+
+                # Decode the output using Greedy Search
+                # TODO: Implement Beam Search here
+                logits = pred.data
+                pred_word_list = []
+                _, max_index = torch.max(logits, dim=1)
+                print(max_index.shape)
+
+                decoded_str = transform_index_to_letter(max_index, letter_list)
+                true_labels = transform_index_to_letter(labels[0], letter_list)
+
+                computed_dist = distance(decoded_str, true_labels)
+                print(computed_dist)
+
+            torch.cuda.empty_cache()
+            del train 
+            del labels
+            del mask
+
+        # Save the model
+        torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    },os.path.join(os.getcwd(),"models","model_run2","model{}.pth".format(epoch+1)))
+
+        model.eval()
+
+        # Validate the model
+        for batch_num,(dev, labels, dev_len, labels_len) in enumerate(val_loader):
+            if USE_CUDA:
+                dev = dev.to(device)
+
+            pred = model(dev, dev_len, labels, train=False) 
+            pred = utils.rnn.pack_sequence(pred, enforce_sorted=False)
+
+            if batch_num % 100 == 1:
+                # Decode the output using Greedy Search
+                # TODO: Implement Beam Search here
+                logits = pred.data
+                pred_word_list = []
+                _, max_index = torch.max(logits, dim=1)
+                print(max_index.shape)
+
+                decoded_str = transform_index_to_letter(max_index, letter_list)
+                true_labels = transform_index_to_letter(labels[0], letter_list)
+
+                computed_dist = distance(decoded_str, true_labels)
+                print(computed_dist)
+
+            torch.cuda.empty_cache()
+            del dev 
+            
+if __name__=="__main__":
+    Main()
+
+    
