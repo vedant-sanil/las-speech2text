@@ -19,6 +19,7 @@ if torch.cuda.is_available():
 else:
     USE_CUDA = False 
 
+
 class BackHook(torch.nn.Module):
     def __init__(self, hook):
         super(BackHook, self).__init__()
@@ -79,31 +80,13 @@ class WeightDrop(torch.nn.Module):
         self._setweights()
         return self.module(*self.hooker(*args))
 
-class pBLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
-        super(pBLSTM, self).__init__()
-        self.blstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, num_layers=1, bidirectional=True)
-
-        # Initialize weights
-        for m in self.modules():
-            if isinstance(m, nn.LSTM):
-                # Code borrowed from Pytorch forums: https://discuss.pytorch.org/t/initializing-parameters-of-a-multi-layer-lstm/5791
-                for name, param in self.blstm.named_parameters():
-                    if 'bias' in name:
-                        nn.init.constant_(param, 0.0)
-                    elif 'weight' in name:
-                        nn.init.xavier_normal_(param)
-
-    def forward(self, x):
-        return self.blstm(x)
-
 class LockedDropout(nn.Module):
     def __init__(self):
         super().__init__()
     def forward(self, x, dropout=0.1):
         if not self.training or not dropout:
             return x
-        m = x.new(1, x.size(1), x.size(2)).bernoulli_(1 - dropout)
+        m = x.data.new(1, x.size(1), x.size(2)).bernoulli_(1 - dropout)
         mask = Variable(m, requires_grad=False) / (1 - dropout)
         mask = mask.expand_as(x)
         return mask*x
@@ -114,7 +97,9 @@ class Listener(nn.Module):
         self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, num_layers=1, bidirectional=True)
 
         # Define blocks of pyramidal pBLSTMs
-        self.prnn = pBLSTM(input_dim=hidden_dim*2, hidden_dim=hidden_dim)
+        self.prnn1 = self.__layers__(input_dim=hidden_dim*2, hidden_dim=hidden_dim)
+        self.prnn2 = self.__layers__(input_dim=hidden_dim*2, hidden_dim=hidden_dim)
+        self.prnn3 = self.__layers__(input_dim=hidden_dim*2, hidden_dim=hidden_dim)
         self.dropout = LockedDropout()
 
         self.key_network = nn.Linear(hidden_dim*2, value_size)
@@ -133,6 +118,11 @@ class Listener(nn.Module):
                 nn.init.normal_(m.weight, 0, 0.01)
                 nn.init.zeros_(m.bias)
 
+    def __layers__(self, input_dim, hidden_dim):
+        bLSTM = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, bidirectional=True)
+
+        return WeightDrop(bLSTM, ['weight_hh_l0', 'weight_hh_l0_reverse'], dropout=0.3)
+
     def reshape_and_pool(self, inputs):
         # Check if the input length is odd and cut it
         if inputs.shape[0] % 2 != 0:
@@ -145,14 +135,6 @@ class Listener(nn.Module):
 
         return outputs
 
-    def layers_lstm(self, linear_input, lens):
-        outputs = self.reshape_and_pool(linear_input)
-        lens = lens//2
-        rnn_inp = utils.rnn.pack_padded_sequence(outputs, lengths=lens, enforce_sorted=False)
-        outputs, _ = self.prnn(rnn_inp)
-
-        return WeightDrop(outputs, ['weight_hh_l0', 'weight_hh_l0_reverse'], dropout=0.5), lens
-
     def forward(self, x, lens):
         rnn_inp = utils.rnn.pack_padded_sequence(x, lengths=lens, enforce_sorted=False)
         outputs, _ = self.lstm(rnn_inp)
@@ -160,23 +142,32 @@ class Listener(nn.Module):
 
         # Pass outputs through pBLSTM blocks
         # Layer 1
-        outputs, lens = self.layers_lstm(linear_input=linear_input, lens=lens)
-        op = self.dropout(outputs, dropout=0.2)
-        linear_input, _ = utils.rnn.pad_packed_sequence(op)
+        outputs = self.reshape_and_pool(linear_input)
+        lens = lens//2
+        rnn_inp = utils.rnn.pack_padded_sequence(outputs, lengths=lens, enforce_sorted=False)
+        outputs, _ = self.prnn1(rnn_inp)
+        linear_input, _ = utils.rnn.pad_packed_sequence(outputs)
+        op = self.dropout(linear_input, dropout=0.2)
 
         # Layer 2
-        outputs, lens = self.layers_lstm(linear_input=linear_input, lens=lens)
-        op = self.dropout(outputs, dropout=0.2)
-        linear_input, _ = utils.rnn.pad_packed_sequence(op)
+        outputs = self.reshape_and_pool(op)
+        lens = lens//2
+        rnn_inp = utils.rnn.pack_padded_sequence(outputs, lengths=lens, enforce_sorted=False)
+        outputs, _ = self.prnn2(rnn_inp)
+        linear_input, _ = utils.rnn.pad_packed_sequence(outputs)
+        op = self.dropout(linear_input, dropout=0.2)
 
         # Layer 3
-        outputs, lens = self.layers_lstm(linear_input=linear_input, lens=lens)
-        op = self.dropout(outputs, dropout=0.2)
-        linear_input, _ = utils.rnn.pad_packed_sequence(op)
+        outputs = self.reshape_and_pool(op)
+        lens = lens//2
+        rnn_inp = utils.rnn.pack_padded_sequence(outputs, lengths=lens, enforce_sorted=False)
+        outputs, _ = self.prnn3(rnn_inp)
+        linear_input, _ = utils.rnn.pad_packed_sequence(outputs)
+        op = self.dropout(linear_input, dropout=0.2)
 
         # Generate key and value pairs
-        keys = self.key_network(linear_input)
-        value = self.value_network(linear_input)
+        keys = self.key_network(op)
+        value = self.value_network(op)
 
         return keys, value, lens
 
@@ -245,7 +236,7 @@ class Speller(nn.Module):
                 # Teacher Forcing and Gumbel Noise
                 rand = np.random.random_sample()
                 if rand > TEACHER_FORCING_PARAM:
-                    prediction = Gumbel(prediction.to('cpu'), torch.tensor([0.25])).sample().to(device)
+                    prediction = Gumbel(prediction.to('cpu'), torch.tensor([0.1])).sample().to(device)
                     char_embed = self.embedding(prediction.argmax(dim=-1))
                 else:
                     char_embed = embeddings[:,i,:]
@@ -334,10 +325,10 @@ def transform_index_to_letter(transcript, letter_list):
     op_list = ""
     final_str = transcript
     for i in range(final_str.shape[0]):
+        if letter_list[final_str[i]] == '<eos>':
+            break
         op_list += letter_list[final_str[i]]
     
-    final_str = re.sub(r'<eos>([\w+]*)<sos>','<eos> <sos>', op_list)
-    #print(final_str)
     return op_list
 
 def load_data():
@@ -391,8 +382,8 @@ def Main():
     global TEACHER_FORCING_PARAM
 
     NUM_EPOCHS = 50
-    TEACHER_FORCING_PARAM = 0.8     # % of how much true labels you want to send into network
-    BATCH_SIZE = 256
+    TEACHER_FORCING_PARAM = 0.55     # % of how much true labels you want to send into network
+    BATCH_SIZE = 32
     device = torch.device("cuda:0" if USE_CUDA else "cpu")
     kwargs = {'num_workers':8, 'pin_memory':True} if USE_CUDA else {}
 
@@ -417,6 +408,12 @@ def Main():
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss(reduce=False).to(device)
 
+    modelDir = os.path.join("./models/model_run2/model20.pth")
+    checkpoint = torch.load(modelDir)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    i = checkpoint['epoch']
+
     train_dataset = Speech2Text_Dataset(speech_train, character_text_train)
     val_dataset = Speech2Text_Dataset(speech_dev, character_text_valid)
     test_dataset = Speech2Text_Dataset(speech_test)
@@ -425,7 +422,7 @@ def Main():
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=speech_collate, **kwargs)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=test_collate, **kwargs)
     
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(i+1,NUM_EPOCHS):
         # Train the model
         model.train()
         tot_loss = 0.0
@@ -446,7 +443,7 @@ def Main():
                 for idx, length in enumerate(true_labels_len):
                     mask[:length,idx] = 1
                 
-                mask = mask.view(-1).to(device)
+                mask = mask.T.contiguous().view(-1).to(device)
 
                 loss = criterion(pred, true_labels)
                 masked_loss = torch.sum(loss*mask)
@@ -485,7 +482,6 @@ def Main():
                     },os.path.join(os.getcwd(),"models","model_run2","model{}.pth".format(epoch+1)))
 
         model.eval()
-
         # Validate the model
         for batch_num,(dev, decode_labels, true_labels, dev_len, decode_labels_len, true_labels_len) in enumerate(val_loader):
             if USE_CUDA:
@@ -494,22 +490,23 @@ def Main():
             pred = model(dev, dev_len, decode_labels, train=False) 
             pred = pred.contiguous().view(-1, pred.size(-1))
 
-            if batch_num % 100 == 1:
-                # Decode the output using Greedy Search
-                # TODO: Implement Beam Search here
-                logits = pred.data
-                pred_word_list = []
-                _, max_index = torch.max(logits, dim=1)
+            # Decode the output using Greedy Search
+            # TODO: Implement Beam Search here
+            logits = pred.data
+            print(logits.shape)
+            pred_word_list = []
+            _, max_index = torch.max(logits, dim=1)
 
-                decoded_str = transform_index_to_letter(max_index, letter_list)
-                correct_labels = transform_index_to_letter(true_labels, letter_list)
 
-                computed_dist = distance(decoded_str, correct_labels)
-                print(decoded_str)
-                print(computed_dist)
+            decoded_str = transform_index_to_letter(max_index, letter_list)
+            correct_labels = transform_index_to_letter(true_labels, letter_list)
+
+            computed_dist = distance(decoded_str, correct_labels)
+            print("Gen: ", decoded_str)
+            print("Actual: ", correct_labels)
 
             torch.cuda.empty_cache()
-            del dev 
+            del dev
             
 if __name__=="__main__":
     Main()
